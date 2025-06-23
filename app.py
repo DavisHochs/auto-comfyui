@@ -13,6 +13,13 @@ OUTPUT_FOLDER = os.getenv(
 )
 ADMIN_USER = os.getenv("ADMIN_USER")
 ADMIN_PASS = os.getenv("ADMIN_PASS")
+
+DEFAULT_REALISM_LORA   = 0.45
+DEFAULT_DETAIL_LORA    = 2.0
+DEFAULT_WORKFLOW_TYPE  = "final"      # or "smoke" if you prefer smoke tests by default
+DEFAULT_FILENAME_PREFIX= "locked_down"
+DEFAULT_EXECUTIONS     = 1
+
 app = Flask(__name__)
 
 # global in-memory history (newest first)
@@ -113,68 +120,68 @@ def generate_prompt():
 @requires_auth
 def generate_image():
     try:
-        data = request.get_json()
-        prompt        = data["prompt"]
-        realism_lora  = data["realism_lora"]
-        detail_lora   = data["detail_lora"]
-        workflow_type = data["workflow_type"]
-        seed    = data.get("seed", None)
-        prefix        = data.get("filename_prefix", None)
-        executions    = data.get("executions", 1)
-        # 1) Determine master and output filenames
-        print(f"DEBUG: Received seed={seed}, prefix={prefix}")  # debug
+        data   = request.get_json()
+        prompt = data["prompt"]
+
+        # 1) Apply your constants
+        realism_lora  = DEFAULT_REALISM_LORA
+        detail_lora   = DEFAULT_DETAIL_LORA
+        workflow_type = DEFAULT_WORKFLOW_TYPE
+        prefix        = DEFAULT_FILENAME_PREFIX
+        executions    = DEFAULT_EXECUTIONS
+        seed          = None  # ensures random per-run seeds below
+
+        # 2) Choose which base workflow file to start from
         master_file = (
             "smoke_test.json" if workflow_type == "smoke"
             else "final_image.json"
         )
         output_file = f"{workflow_type}_updated.json"
 
-        # 2) update_on_disk & get node map (passing seed!)
-        
-        # First, update the workflow JSON on disk once
+        # 3) Inject prompt, LoRA strengths and prefix into the JSON once
         node_map = update_and_inject(
             master_file, output_file,
             prompt, realism_lora, detail_lora,
             seed, prefix
         )
 
-        # Build the final payload just like comfy_auto.py did
+        # 4) Enqueue `executions` jobs, each with its own random seed
         import uuid
         job_id = str(uuid.uuid4())
-            # Now enqueue it `executions` times, with distinct random seeds if needed
         for i in range(executions):
-            # decide seed per iteration
-            this_seed = seed if seed is not None else random.randint(0, 2**53 - 1)
-
+            this_seed = random.randint(0, 2**53 - 1)
             payload = {
-            "prompt": node_map,
-            "client_id": job_id + f"_{i+1}",
-            "filename_prefix": job_id,
+                "prompt": node_map,
+                "client_id": f"{job_id}_{i+1}",
+                "filename_prefix": job_id,
             }
-            # inject the per‐run seed into the payload's node map
+            # override the seed in every KSampler node
             for node in payload["prompt"].values():
                 if node.get("class_type") == "KSampler":
                     node["inputs"]["seed"] = this_seed
 
             r = requests.post(
-            "http://127.0.0.1:8188/prompt",
-            json=payload,
-            timeout=5
+                "http://127.0.0.1:8188/prompt",
+                json=payload,
+                timeout=5
             )
             r.raise_for_status()
-            # record exactly *one* history entry for this whole batch
+
+        # 5) Log exactly one history entry for the batch
         queue_history.insert(0, {
-        "time":            datetime.utcnow().isoformat(),
-       "prompt":          prompt,
-       "realism_lora":    realism_lora,
-        "detail_lora":     detail_lora,
-        "workflow_type":   workflow_type,
-        "seed":            seed,
-        "executions":      executions,
-        "filename_prefix": prefix,
-        "batch_id":        job_id
-    })
+            "time":            datetime.utcnow().isoformat(),
+            "prompt":          prompt,
+            "realism_lora":    realism_lora,
+            "detail_lora":     detail_lora,
+            "workflow_type":   workflow_type,
+            "seed":            None,
+            "executions":      executions,
+            "filename_prefix": prefix,
+            "batch_id":        job_id
+        })
+
         return jsonify({"job_id": r.text})
+
     except requests.RequestException as req_err:
         return jsonify({"error": f"ComfyUI request failed: {req_err}"}), 502
     except Exception as e:
